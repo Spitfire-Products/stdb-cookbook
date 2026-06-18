@@ -1,6 +1,6 @@
 # Chapter 4 — Schema Discipline & The `--clear` Discipline
 
-> *Written against SpacetimeDB 2.0/2.1. Canonical implementations: [nexus-chat](https://github.com/Spitfire-Products/nexus-chat) `module/src/tables/*.rs` and `module/src/reducers/shadow_index_backfill.rs`.*
+> *Written against SpacetimeDB 2.0/2.1, with a 2.6 forced-migration case study (Pattern 5). Canonical implementations: [nexus-chat](https://github.com/Spitfire-Products/nexus-chat) `module/src/tables/*.rs` and `module/src/reducers/shadow_index_backfill.rs`.*
 
 ## The problem
 
@@ -211,6 +211,99 @@ The chat module exposes `runtime_config_mirror` — a public, read-only mirror o
 
 Generalized rule: **when a write goes into a table that clients can't subscribe to (private, RLS-restricted, or cross-module), mirror to a table they can.** Don't try to make the source table public — you lose your security boundary. Don't make clients hit an HTTP endpoint to read it — you lose real-time updates. Mirror.
 
+## Pattern 5: The backup → `--clear` → restore harness (when a column type MUST change)
+
+Pattern 1 says "never change a column's type." But sometimes you don't get a choice — an *upstream* change forces a breaking migration on a table full of production data. When that happens, the only safe path is a **deliberate, instrumented `--clear` with a full backup/restore cycle**. This is the disaster-recovery harness you hope you never need and are very glad you built.
+
+### The forcing function (a real one)
+
+SpacetimeDB maincloud is a managed cloud — Clockwork controls when it upgrades. In mid-2026 it auto-upgraded to 2.6, which shipped [PR #5287 "Parameterized query plans"](https://github.com/clockworklabs/SpacetimeDB/pull/5287). That retyped the RLS `:sender` from a substituted literal into a **typed `Identity` parameter**. Overnight, every `#[client_visibility_filter]` comparing a **hex-`String`** column to `:sender` was rejected at publish:
+
+```
+Unexpected type: (expected) (__identity__: U256) != String (inferred)
+```
+
+The fix was to migrate the RLS column `String → Identity` — a **column-type change**, which Pattern 1 tells you needs `--clear`. Across 7 modules, including data-bearing ones (one with 1.1M rows, one with ~18K rows of non-regenerable agent state). No amount of schema discipline prevents this; the discipline is in *how you survive it*.
+
+### The three pieces
+
+**1. Backup — read-only, owner-token, captures private + RLS tables.** `spacetime sql` has no `--json` in the CLI, so use the HTTP SQL API (`POST /v1/database/<module>/sql`) authenticated with the **owner token** from `~/.config/spacetime/cli.toml`. The owner bypasses RLS, so a single pass captures private and RLS-scoped tables too. Write each table to JSON plus a manifest with row counts and a sha256 per table.
+
+**2. Verbatim import reducers — `import_<table>` + `import_<table>_batch`.** Generate, per table, a reducer that inserts a backed-up row exactly as captured. A macro keeps it terse:
+
+```rust
+macro_rules! import_table {
+    ($single:ident, $batch:ident, $accessor:ident, $ty:ty) => {
+        #[reducer]
+        pub fn $single(ctx: &ReducerContext, row: $ty) -> Result<(), String> {
+            require_recovery_owner(ctx)?;
+            ctx.db.$accessor().insert(row);
+            Ok(())
+        }
+        #[reducer]
+        pub fn $batch(ctx: &ReducerContext, rows: Vec<$ty>) -> Result<(), String> {
+            require_recovery_owner(ctx)?;
+            for row in rows { ctx.db.$accessor().insert(row); }
+            Ok(())
+        }
+    };
+}
+import_table!(import_users, import_users_batch, users, User);
+// ... one line per table (skip scheduled/job tables — they re-seed) ...
+```
+
+The row-struct-as-reducer-arg is the key trick: the reducer takes the full table row type, so the restore driver sends back exactly what the backup captured. **Codegen these from the table list** — for an 80-table module you do not hand-write them. (Gotcha: a glob `use crate::tables::*` does NOT bring the accessor methods into scope — you get "no method named X" for every table. Use explicit per-module `use crate::tables::<mod>::{<accessor>, <Struct>};`.)
+
+**3. Restore driver — batched, bounded-concurrency `/call` replay + verify.** Read the backup JSON, POST each table's rows to `/call/import_<table>_batch`, then re-export and diff counts against the manifest.
+
+### The flow
+
+```
+fresh backup  →  --clear publish (migrated schema)  →  claim recovery owner
+              →  2-pass restore  →  verify counts  →  runtime-prove the migration
+```
+
+### Hard-won details
+
+- **Two-pass restore.** Data tables restore batched (`--batch 1000`). **Identity-keyed tables restore per-row** (`--batch 1`). Why: the post-clear bootstrap (and any live reconnect) writes an identity row that **collides** with a backed-up row; a unique/PK-collision `insert` **panics**, and a panic in a batch loses the *entire* batch. Per-row, you lose exactly the one already-present row (count still reconciles).
+- **Identity `/call` encoding.** A migrated `Identity` column is sent as `["0x<hex>"]` (single-element array, `0x`-prefixed). `Option<T>` args encode as `{"some": v}` (object) or `[0, v]`/`[1, []]` (tag) — both are accepted over HTTP `/call`.
+- **Batch body ≈ 1 MB limit.** Even small rows × 1000 can blow the `/call` body ceiling. Compute a safe batch per table (`rows × avg_bytes < ~800 KB`); a table averaging 1.6 KB/row needs `--batch 500`, not 1000.
+- **Oversized single rows (> ~1 MB) `413` and cannot be restored via HTTP `/call`** — e.g. a chat attachment storing a 3.5 MB base64 image inline. Fall back to the `spacetime call` CLI (different limit) or skip + self-heal. (Also: that's a design smell — large blobs belong in object storage, not an inline column.)
+- **Throughput.** Per-row restore is commit-bound (~180 rows/s — one fsync per row). Batched (1000/txn) sustains ~185–210K rows/s once the host's token-validator cache is warm. Frame this honestly as *rows/sec via batching* — not "beat the TPS benchmark" (rows ≠ transactions; the 160K-tx/s figure is WebSocket-pipelined capacity, a different axis).
+- **Skip scheduled/cron tables and regenerable caches.** Scheduled tables re-seed from their schedulers (or a `seed_*`/`arm_*` reducer you call post-restore). Admin/analytics caches regenerate on the next refresh — skip them and re-run the refresh reducer instead of restoring stale snapshots.
+
+### Authorizing the restore is the genuinely hard part
+
+Post-`--clear` the database is **empty** — no users, no roster, no identity links. So the recovery import reducers *cannot* check any stored role/membership to authorize the operator. And the obvious "is this an internal call" check, `ctx.sender() == ctx.identity()`, **does not match the owner's CLI** — `ctx.identity()` is the *module's* identity, not the database owner's, so it's only true for internal/scheduled calls. (We shipped this wrong twice before pinning it down.)
+
+The only signal available post-clear is the caller's intrinsic **identity**. The pattern that works without hardcoding a specific identity is **claim-based trust-on-first-use**:
+
+```rust
+#[spacetimedb::table(accessor = recovery_owner)]   // private singleton
+pub struct RecoveryOwner { #[primary_key] pub id: u8, pub owner: Identity }
+
+#[reducer]
+pub fn claim_recovery_owner(ctx: &ReducerContext) -> Result<(), String> {
+    match ctx.db.recovery_owner().id().find(&0u8) {
+        Some(ro) if ro.owner == ctx.sender() => Ok(()),               // idempotent
+        Some(_) => Err("already claimed by another identity".into()),
+        None => { ctx.db.recovery_owner().insert(RecoveryOwner { id: 0, owner: ctx.sender() }); Ok(()) }
+    }
+}
+
+fn require_recovery_owner(ctx: &ReducerContext) -> Result<(), String> {
+    if ctx.sender() == ctx.identity() { return Ok(()); }             // internal/scheduled
+    match ctx.db.recovery_owner().id().find(&0u8) {
+        Some(ro) if ro.owner == ctx.sender() => Ok(()),
+        _ => Err("not the recovery owner — call claim_recovery_owner first".into()),
+    }
+}
+```
+
+The restore's first step is `claim_recovery_owner` — whoever runs the restore (the operator) becomes the authorized owner; every `import_*` then requires `sender == recovery_owner`. The TOFU window is only the post-clear moment, operator-controlled. A `release_recovery_owner` (current-owner-only) supports re-keying.
+
+> **The vuln we shipped first.** Our initial gate was "caller is a *registered* identity" — which, the moment any normal user logs in, lets *them* call `import_users`, `import_secrets`, `import_*_keys`, `import_org_memberships`… i.e. inject arbitrary rows into any table. Recovery import reducers are **owner-only by nature**; design the gate for that from line one, not as a follow-up. If you generate powerful reducers, generate the authorization with them.
+
 ## Tradeoffs and gotchas
 
 **Migration compatibility is checked at publish time, not author time.** You won't know your column add is incompatible until `spacetime publish` rejects it (or worse, a `dev`-mode `--delete-data` wipe runs). Always have a `cargo check` step in CI; it catches some structural errors before publish.
@@ -224,6 +317,8 @@ Generalized rule: **when a write goes into a table that clients can't subscribe 
 **Replit + Rust 1.93 needs `GLIBC_TUNABLES=glibc.rtld.optional_static_tls=65536`.** Specific to Replit dev environments — without it, Rust 1.92+ binaries fail with "cannot allocate memory in static TLS block" because Replit's `LD_AUDIT` runtime loader consumes static TLS space. Set in deploy scripts and `cargo check` invocations. This is on the deploy infrastructure side, not a STDB concern, but it bites STDB module builds first because they're large compilations.
 
 **`features = ["unstable"]` is required for RLS as of STDB 2.0.** Don't remove it from `Cargo.toml` — the `#[client_visibility_filter]` macro is gated behind it, and dropping the feature flag silently drops your RLS rules. Code review for `features = []` changes on STDB modules. (Once Views API replaces RLS, this gate may relax — but until then, treat the unstable flag as load-bearing.)
+
+**On managed cloud, you don't control when the server upgrades — so a breaking change can arrive unbidden.** RLS is gated `unstable`, which means it's allowed to break across versions, and maincloud auto-upgrades on Clockwork's schedule, not yours. The 2.6 `:sender` retype (Pattern 5) shipped as an internal refactor marked "breaking changes: N/A" and silently broke every `String = :sender` RLS filter at next-publish. Defenses: keep the backup/restore harness ready *before* you need it, pin your CLI/crate versions so the toolchain is reproducible, and treat "anonymous read of an RLS table returns a type error" as the canary that the server's `:sender` typing changed under you. Your module schema must satisfy the *server's* validator — and on managed cloud the server can move first.
 
 ## In the skill
 
@@ -241,6 +336,9 @@ The migration compatibility table in this chapter expands on the skill content w
 | Cascade-delete dual-write | `module/src/reducers/messages.rs:393-415` | Delete from both tables |
 | Idempotent backfill | `module/src/reducers/shadow_index_backfill.rs` | Populate from existing rows |
 | Deploy script (data-safe) | `scripts/spacetimedb-publish-chat.sh` | Default is preserve, `--clear` separate |
+| Verbatim import reducers | `module/src/reducers/import_recovery.rs` | `import_<table>(_batch)` for backup/restore (Pattern 5) |
+| Claim-based recovery owner | `import_recovery.rs` (`recovery_owner` + `claim_recovery_owner`) | Authorize the post-`--clear` restore without a roster |
+| Backup / restore / verify harness | `scripts/stdb-{backup.sh,restore.mjs,verify.mjs}` | Owner-token export, batched `/call` replay, count-diff verify |
 
 ---
 

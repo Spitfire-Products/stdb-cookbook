@@ -58,6 +58,8 @@ Every client sees only their own link. This is the *only* table with a `client_v
 
 Requires `features = ["unstable"]` in your `Cargo.toml`. As of STDB 2.0 the `#[client_visibility_filter]` macro is gated behind that feature flag.
 
+> **⚠️ SpacetimeDB 2.6+ — the column must be a native `Identity`, not a hex `String`.** The `stdb_identity: String` shown above is the pre-2.6 pattern. 2.6 ([PR #5287](https://github.com/clockworklabs/SpacetimeDB/pull/5287)) retyped `:sender` into a typed `Identity` parameter, so `WHERE stdb_identity = :sender` against a `String` column is **rejected at publish** (`Unexpected type: (__identity__: U256) != String`). On 2.6+, define `pub stdb_identity: Identity` (derive it from `ctx.sender()`, not a hex string), and `find`/`delete` with `&ctx.sender()`. A *quoted hex string literal* still coerces to `Identity` in a normal column comparison, so client `WHERE` filters keep working — but the strictly-typed `:sender` parameter does not coerce, which is why the column itself must change. Migrating an existing `String` column to `Identity` is a **breaking change requiring `--clear`** — see [Chapter 4, Pattern 5](./04-schema-discipline.md#pattern-5-the-backup----clear--restore-harness-when-a-column-type-must-change) for the backup/restore harness that makes it survivable.
+
 ### The register reducer
 
 ```rust
